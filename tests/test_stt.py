@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
+from vllm_metal.stt import audio as audio_mod
 from vllm_metal.stt.audio import SAMPLE_RATE, audio_duration, split_audio
 from vllm_metal.stt.config import (
     SpeechToTextConfig,
@@ -235,6 +240,62 @@ class TestAudioPipeline:
         assert window[200].item() > window[0].item()
 
 
+class TestAudioLoading:
+    """Tests for audio loading fallback and ffmpeg timeout behavior."""
+
+    def test_load_audio_falls_back_to_ffmpeg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        called: dict[str, object] = {}
+
+        def fake_librosa_load(*_args: object, **_kwargs: object) -> None:
+            raise ValueError("force ffmpeg fallback")
+
+        def fake_load_audio_ffmpeg(
+            file_path: str,
+            sample_rate: int,
+            timeout_s: float = audio_mod._FFMPEG_TIMEOUT_S,
+        ) -> mx.array:
+            called["file_path"] = file_path
+            called["sample_rate"] = sample_rate
+            called["timeout_s"] = timeout_s
+            return mx.array(np.zeros(4, dtype=np.float32))
+
+        monkeypatch.setitem(
+            sys.modules, "librosa", SimpleNamespace(load=fake_librosa_load)
+        )
+        monkeypatch.setattr(audio_mod, "_load_audio_ffmpeg", fake_load_audio_ffmpeg)
+
+        audio = audio_mod.load_audio("dummy.wav")
+
+        assert called["file_path"] == "dummy.wav"
+        assert called["sample_rate"] == SAMPLE_RATE
+        assert called["timeout_s"] == pytest.approx(audio_mod._FFMPEG_TIMEOUT_S)
+        assert audio.shape[0] == 4
+
+    def test_load_audio_ffmpeg_timeout_uses_configured_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        timeout_s = 12.0
+        monkeypatch.setattr("shutil.which", lambda _binary: "/usr/bin/ffmpeg")
+
+        def fake_run(
+            cmd: list[str], capture_output: bool, timeout: float
+        ) -> subprocess.CompletedProcess[bytes]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+        monkeypatch.setattr(audio_mod.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="ffmpeg timed out after 12.0s"):
+            audio_mod._load_audio_ffmpeg("dummy.wav", SAMPLE_RATE, timeout_s=timeout_s)
+
+    def test_load_audio_ffmpeg_rejects_non_positive_timeout(self) -> None:
+        timeout_s = 0.0
+
+        with pytest.raises(ValueError, match="ffmpeg timeout must be > 0"):
+            audio_mod._load_audio_ffmpeg("dummy.wav", SAMPLE_RATE, timeout_s=timeout_s)
+
+
 # ===========================================================================
 # Audio chunking
 # ===========================================================================
@@ -288,3 +349,25 @@ class TestAudioChunking:
         assert len(chunks) >= 2
         _, second_start = chunks[1]
         assert 26.0 <= second_start <= 31.0
+
+    def test_split_chunks_never_exceed_max_clip(self) -> None:
+        """No chunk should be longer than max_clip_s samples."""
+        max_clip_s = 10.0
+        max_samples = int(max_clip_s * SAMPLE_RATE)
+        audio = mx.array(np.random.randn(50 * SAMPLE_RATE).astype(np.float32))
+        chunks = split_audio(audio, max_clip_s=max_clip_s, overlap_s=0.0)
+
+        for chunk, _ in chunks:
+            assert chunk.shape[0] <= max_samples
+
+    def test_split_small_clip_silent_audio_avoids_tiny_chunks(self) -> None:
+        """Small max_clip_s should not degrade into 1-sample chunks."""
+        max_clip_s = 0.4
+        max_samples = int(max_clip_s * SAMPLE_RATE)
+        audio = mx.zeros(2 * SAMPLE_RATE)
+
+        chunks = split_audio(audio, max_clip_s=max_clip_s, overlap_s=0.0)
+
+        assert len(chunks) == 5
+        for chunk, _ in chunks:
+            assert chunk.shape[0] == max_samples
