@@ -249,8 +249,7 @@ class MetalPlatform(Platform):
                     scheduler_config.max_num_scheduled_tokens = model_max
 
             logger.info(
-                "Metal: disabled chunked prefill, "
-                "max_num_batched_tokens=%d",
+                "Metal: disabled chunked prefill, max_num_batched_tokens=%d",
                 scheduler_config.max_num_batched_tokens,
             )
 
